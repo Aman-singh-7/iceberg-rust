@@ -254,7 +254,10 @@ impl HttpClient {
     ///
     /// Returns `Ok(None)` when there is no credential to refresh with (static
     /// token or unauthenticated client), leaving the original 401 to propagate.
-    async fn refresh_after_unauthorized(&self, stale_token: Option<&str>) -> Result<Option<String>> {
+    async fn refresh_after_unauthorized(
+        &self,
+        stale_token: Option<&str>,
+    ) -> Result<Option<String>> {
         if self.credential.is_none() {
             return Ok(None);
         }

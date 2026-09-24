@@ -26,7 +26,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Runtime, TableCommit, TableCreation, TableIdent,
 };
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers};
 use sqlx::{Any, AnyPool, Row, Transaction};
@@ -67,6 +67,7 @@ static TEST_BEFORE_ACQUIRE: bool = true; // Default the health-check of each con
 pub struct SqlCatalogBuilder {
     config: SqlCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    runtime: Option<Runtime>,
 }
 
 impl Default for SqlCatalogBuilder {
@@ -80,6 +81,7 @@ impl Default for SqlCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            runtime: None,
         }
     }
 }
@@ -143,6 +145,11 @@ impl CatalogBuilder for SqlCatalogBuilder {
         self
     }
 
+    fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     fn load(
         mut self,
         name: impl Into<String>,
@@ -190,7 +197,11 @@ impl CatalogBuilder for SqlCatalogBuilder {
                 ))
             } else {
                 self.config.name = name;
-                SqlCatalog::new(self.config, self.storage_factory).await
+                let runtime = match self.runtime {
+                    Some(rt) => rt,
+                    None => Runtime::try_current()?,
+                };
+                SqlCatalog::new(self.config, self.storage_factory, runtime).await
             }
         }
     }
@@ -221,6 +232,7 @@ pub struct SqlCatalog {
     warehouse_location: String,
     fileio: FileIO,
     sql_bind_style: SqlBindStyle,
+    runtime: Runtime,
 }
 
 #[derive(Debug, PartialEq, strum::EnumString, strum::Display)]
@@ -237,6 +249,7 @@ impl SqlCatalog {
     async fn new(
         config: SqlCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
+        runtime: Runtime,
     ) -> Result<Self> {
         let factory = storage_factory.ok_or_else(|| {
             Error::new(
@@ -244,7 +257,11 @@ impl SqlCatalog {
                 "StorageFactory must be provided for SqlCatalog. Use `with_storage_factory` to configure it.",
             )
         })?;
-        let fileio = FileIOBuilder::new(factory).build();
+        // Forward catalog props so storage-backend keys reach the FileIO.
+        // Unrecognized keys are ignored by backends.
+        let fileio = FileIOBuilder::new(factory)
+            .with_props(config.props.clone())
+            .build();
 
         install_default_drivers();
         let max_connections: u32 = config
@@ -303,6 +320,7 @@ impl SqlCatalog {
             warehouse_location: config.warehouse_location,
             fileio,
             sql_bind_style: config.sql_bind_style,
+            runtime,
         })
     }
 
@@ -584,7 +602,7 @@ impl Catalog for SqlCatalog {
             let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
             let update_stmt = format!(
                 "UPDATE {NAMESPACE_TABLE_NAME} SET {NAMESPACE_FIELD_PROPERTY_VALUE} = ?
-                 WHERE {CATALOG_FIELD_CATALOG_NAME} = ? 
+                 WHERE {CATALOG_FIELD_CATALOG_NAME} = ?
                  AND {NAMESPACE_FIELD_NAME} = ?
                  AND {NAMESPACE_FIELD_PROPERTY_KEY} = ?"
             );
@@ -675,7 +693,7 @@ impl Catalog for SqlCatalog {
                          WHERE {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                           AND {CATALOG_FIELD_CATALOG_NAME} = ?
                           AND (
-                                {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                                {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                                 OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                           )",
                     ),
@@ -714,7 +732,7 @@ impl Catalog for SqlCatalog {
                       AND {CATALOG_FIELD_CATALOG_NAME} = ?
                       AND {CATALOG_FIELD_TABLE_NAME} = ?
                       AND (
-                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                         OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                       )"
                 ),
@@ -741,7 +759,7 @@ impl Catalog for SqlCatalog {
                   AND {CATALOG_FIELD_TABLE_NAME} = ?
                   AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                   AND (
-                    {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                    {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                     OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                   )"
             ),
@@ -755,6 +773,12 @@ impl Catalog for SqlCatalog {
         .await?;
 
         Ok(())
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+        let table_info = self.load_table(table).await?;
+        self.drop_table(table).await?;
+        iceberg::drop_table_data(&table_info).await
     }
 
     async fn load_table(&self, identifier: &TableIdent) -> Result<Table> {
@@ -771,7 +795,7 @@ impl Catalog for SqlCatalog {
                       AND {CATALOG_FIELD_TABLE_NAME} = ?
                       AND {CATALOG_FIELD_TABLE_NAMESPACE} = ?
                       AND (
-                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}' 
+                        {CATALOG_FIELD_RECORD_TYPE} = '{CATALOG_FIELD_TABLE_RECORD_TYPE}'
                         OR {CATALOG_FIELD_RECORD_TYPE} IS NULL
                       )"
                 ),
@@ -799,6 +823,7 @@ impl Catalog for SqlCatalog {
             .identifier(identifier.clone())
             .metadata_location(tbl_metadata_location)
             .metadata(metadata)
+            .runtime(self.runtime.clone())
             .build()?)
     }
 
@@ -869,6 +894,7 @@ impl Catalog for SqlCatalog {
             .metadata_location(tbl_metadata_location_str)
             .identifier(tbl_ident)
             .metadata(tbl_metadata)
+            .runtime(self.runtime.clone())
             .build()?)
     }
 
@@ -940,6 +966,7 @@ impl Catalog for SqlCatalog {
             .metadata_location(metadata_location)
             .metadata(metadata)
             .file_io(self.fileio.clone())
+            .runtime(self.runtime.clone())
             .build()?)
     }
 
@@ -1155,6 +1182,33 @@ mod tests {
         // catalog instantiation should not fail even if tables exist
         new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
         new_sql_catalog(warehouse_loc.clone(), Some("iceberg")).await;
+    }
+
+    // Regression test: storage-backend props set on the catalog must reach
+    // the FileIO; otherwise authenticated backends fail with 401s on writes.
+    #[tokio::test]
+    async fn test_storage_props_propagate_to_file_io() {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        let warehouse_location = temp_path();
+
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "iceberg",
+                HashMap::from_iter([
+                    (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+                    (SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse_location),
+                    ("s3.region".to_string(), "us-east-1".to_string()),
+                    ("hf.token".to_string(), "hf_test_token".to_string()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let props = catalog.fileio.config().props();
+        assert_eq!(props.get("s3.region"), Some(&"us-east-1".to_string()));
+        assert_eq!(props.get("hf.token"), Some(&"hf_test_token".to_string()));
     }
 
     #[tokio::test]

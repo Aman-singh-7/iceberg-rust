@@ -22,8 +22,6 @@ use std::str::FromStr;
 use crate::compression::CompressionCodec;
 use crate::error::{Error, ErrorKind, Result};
 
-// Helper function to parse a property from a HashMap
-// If the property is not found, use the default value
 fn parse_property<T: FromStr>(
     properties: &HashMap<String, String>,
     key: &str,
@@ -78,18 +76,22 @@ pub(crate) fn parse_metadata_file_compression(
         Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Invalid metadata compression codec: {value}. Only 'none' and 'gzip' are supported."
+                "Invalid metadata compression codec: {value}. Only '{}' and '{}' are supported.",
+                CompressionCodec::None.name(),
+                CompressionCodec::gzip_default().name()
             ),
         )
     })?;
 
     // Validate that only None and Gzip are used for metadata
     match codec {
-        CompressionCodec::None | CompressionCodec::Gzip => Ok(codec),
-        CompressionCodec::Lz4 | CompressionCodec::Zstd => Err(Error::new(
+        CompressionCodec::None | CompressionCodec::Gzip(_) => Ok(codec),
+        _ => Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
-                "Invalid metadata compression codec: {value}. Only 'none' and 'gzip' are supported for metadata files."
+                "Invalid metadata compression codec: {value}. Only '{}' and '{}' are supported for metadata files.",
+                CompressionCodec::None.name(),
+                CompressionCodec::gzip_default().name()
             ),
         )),
     }
@@ -114,6 +116,29 @@ pub struct TableProperties {
     pub metadata_compression_codec: CompressionCodec,
     /// Whether to use `FanoutWriter` for partitioned tables.
     pub write_datafusion_fanout_enabled: bool,
+    /// Whether garbage collection is enabled on drop.
+    /// When `false`, data files will not be deleted when a table is dropped.
+    pub gc_enabled: bool,
+    /// Default maximum age of a snapshot to keep when expiring snapshots.
+    pub max_snapshot_age_ms: i64,
+    /// Default minimum number of snapshots to keep per branch when expiring snapshots.
+    pub min_snapshots_to_keep: usize,
+    /// Default maximum age of a snapshot reference to keep when expiring snapshots.
+    pub max_ref_age_ms: i64,
+    /// Whether content-defined chunking is enabled.
+    /// `true` only when `write.parquet.content-defined-chunking.enabled = "true"`.
+    pub cdc_enabled: bool,
+    /// Content-defined chunking minimum chunk size in bytes.
+    pub cdc_min_chunk_size: usize,
+    /// Content-defined chunking maximum chunk size in bytes.
+    pub cdc_max_chunk_size: usize,
+    /// Content-defined chunking normalization level (gearhash bit adjustment).
+    pub cdc_norm_level: i32,
+    /// The master key id used to encrypt this table's manifest list and data
+    /// files. `None` if `encryption.key-id` is not set.
+    pub encryption_key_id: Option<String>,
+    /// The encryption data encryption key length in bytes.
+    pub encryption_data_key_length: usize,
 }
 
 impl TableProperties {
@@ -212,6 +237,55 @@ impl TableProperties {
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str = "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
+
+    /// Property key for enabling garbage collection on drop.
+    /// When set to `false`, data files will not be deleted when a table is dropped.
+    /// Defaults to `true`.
+    pub const PROPERTY_GC_ENABLED: &str = "gc.enabled";
+    /// Default value for gc.enabled
+    pub const PROPERTY_GC_ENABLED_DEFAULT: bool = true;
+
+    /// Property key for the default maximum age of a snapshot to keep when expiring snapshots.
+    pub const PROPERTY_MAX_SNAPSHOT_AGE_MS: &str = "history.expire.max-snapshot-age-ms";
+    /// Default value for history.expire.max-snapshot-age-ms (5 days).
+    pub const PROPERTY_MAX_SNAPSHOT_AGE_MS_DEFAULT: i64 = 5 * 24 * 60 * 60 * 1000;
+    /// Property key for the default minimum number of snapshots to keep when expiring snapshots.
+    pub const PROPERTY_MIN_SNAPSHOTS_TO_KEEP: &str = "history.expire.min-snapshots-to-keep";
+    /// Default value for history.expire.min-snapshots-to-keep.
+    pub const PROPERTY_MIN_SNAPSHOTS_TO_KEEP_DEFAULT: usize = 1;
+    /// Property key for the default maximum age of a snapshot reference to keep when expiring.
+    pub const PROPERTY_MAX_REF_AGE_MS: &str = "history.expire.max-ref-age-ms";
+    /// Default value for history.expire.max-ref-age-ms (effectively never expire refs).
+    pub const PROPERTY_MAX_REF_AGE_MS_DEFAULT: i64 = i64::MAX;
+
+    /// Enable content-defined chunking with parquet defaults (or per-property overrides).
+    pub const PROPERTY_PARQUET_CDC_ENABLED: &str = "write.parquet.content-defined-chunking.enabled";
+    /// Default value for content-defined chunking enabled.
+    pub const PROPERTY_PARQUET_CDC_ENABLED_DEFAULT: bool = false;
+    /// Minimum chunk size in bytes for content-defined chunking.
+    pub const PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE: &str =
+        "write.parquet.content-defined-chunking.min-chunk-size";
+    /// Default matches `parquet::file::properties::DEFAULT_CDC_MIN_CHUNK_SIZE`.
+    pub const PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE_DEFAULT: usize = 256 * 1024;
+    /// Maximum chunk size in bytes for content-defined chunking.
+    pub const PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE: &str =
+        "write.parquet.content-defined-chunking.max-chunk-size";
+    /// Default matches `parquet::file::properties::DEFAULT_CDC_MAX_CHUNK_SIZE`.
+    pub const PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE_DEFAULT: usize = 1024 * 1024;
+    /// Normalization level (gearhash bit adjustment) for content-defined chunking.
+    pub const PROPERTY_PARQUET_CDC_NORM_LEVEL: &str =
+        "write.parquet.content-defined-chunking.norm-level";
+    /// Default matches `parquet::file::properties::DEFAULT_CDC_NORM_LEVEL`.
+    pub const PROPERTY_PARQUET_CDC_NORM_LEVEL_DEFAULT: i32 = 0;
+
+    /// Property key for the master key id used to encrypt the table's manifest
+    /// list and data files as defined in https://iceberg.apache.org/docs/nightly/encryption/.
+    pub const PROPERTY_ENCRYPTION_KEY_ID: &str = "encryption.key-id";
+
+    /// Property key for the encryption data encryption key (DEK) length in bytes.
+    pub const PROPERTY_ENCRYPTION_DATA_KEY_LENGTH: &str = "encryption.data-key-length";
+    /// Default value for the encryption DEK length (16 bytes = AES-128).
+    pub const PROPERTY_ENCRYPTION_DATA_KEY_LENGTH_DEFAULT: usize = 16;
 }
 
 impl TryFrom<&HashMap<String, String>> for TableProperties {
@@ -256,6 +330,54 @@ impl TryFrom<&HashMap<String, String>> for TableProperties {
                 TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED,
                 TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT,
             )?,
+            gc_enabled: parse_property(
+                props,
+                TableProperties::PROPERTY_GC_ENABLED,
+                TableProperties::PROPERTY_GC_ENABLED_DEFAULT,
+            )?,
+            max_snapshot_age_ms: parse_property(
+                props,
+                TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS,
+                TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS_DEFAULT,
+            )?,
+            min_snapshots_to_keep: parse_property(
+                props,
+                TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP,
+                TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+            )?,
+            max_ref_age_ms: parse_property(
+                props,
+                TableProperties::PROPERTY_MAX_REF_AGE_MS,
+                TableProperties::PROPERTY_MAX_REF_AGE_MS_DEFAULT,
+            )?,
+            cdc_enabled: parse_property(
+                props,
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED,
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED_DEFAULT,
+            )?,
+            cdc_min_chunk_size: parse_property(
+                props,
+                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE,
+                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE_DEFAULT,
+            )?,
+            cdc_max_chunk_size: parse_property(
+                props,
+                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE,
+                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE_DEFAULT,
+            )?,
+            cdc_norm_level: parse_property(
+                props,
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL,
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL_DEFAULT,
+            )?,
+            encryption_key_id: props
+                .get(TableProperties::PROPERTY_ENCRYPTION_KEY_ID)
+                .cloned(),
+            encryption_data_key_length: parse_property(
+                props,
+                TableProperties::PROPERTY_ENCRYPTION_DATA_KEY_LENGTH,
+                TableProperties::PROPERTY_ENCRYPTION_DATA_KEY_LENGTH_DEFAULT,
+            )?,
         })
     }
 }
@@ -294,6 +416,44 @@ mod tests {
             table_properties.metadata_compression_codec,
             CompressionCodec::None
         );
+        assert_eq!(
+            table_properties.gc_enabled,
+            TableProperties::PROPERTY_GC_ENABLED_DEFAULT
+        );
+        assert_eq!(
+            table_properties.max_snapshot_age_ms,
+            TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS_DEFAULT
+        );
+        assert_eq!(
+            table_properties.min_snapshots_to_keep,
+            TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP_DEFAULT
+        );
+        assert_eq!(
+            table_properties.max_ref_age_ms,
+            TableProperties::PROPERTY_MAX_REF_AGE_MS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn test_table_properties_history_expire_overrides() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS.to_string(),
+                "1234".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP.to_string(),
+                "7".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_MAX_REF_AGE_MS.to_string(),
+                "5678".to_string(),
+            ),
+        ]);
+        let table_properties = TableProperties::try_from(&props).unwrap();
+        assert_eq!(table_properties.max_snapshot_age_ms, 1234);
+        assert_eq!(table_properties.min_snapshots_to_keep, 7);
+        assert_eq!(table_properties.max_ref_age_ms, 5678);
     }
 
     #[test]
@@ -305,7 +465,7 @@ mod tests {
         let table_properties = TableProperties::try_from(&props).unwrap();
         assert_eq!(
             table_properties.metadata_compression_codec,
-            CompressionCodec::Gzip
+            CompressionCodec::gzip_default()
         );
     }
 
@@ -332,7 +492,7 @@ mod tests {
         let table_properties = TableProperties::try_from(&props_upper).unwrap();
         assert_eq!(
             table_properties.metadata_compression_codec,
-            CompressionCodec::Gzip
+            CompressionCodec::gzip_default()
         );
 
         // Test mixed case
@@ -343,7 +503,7 @@ mod tests {
         let table_properties = TableProperties::try_from(&props_mixed).unwrap();
         assert_eq!(
             table_properties.metadata_compression_codec,
-            CompressionCodec::Gzip
+            CompressionCodec::gzip_default()
         );
 
         // Test "NONE" should also be case-insensitive
@@ -377,12 +537,17 @@ mod tests {
                 TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
                 "512".to_string(),
             ),
+            (
+                TableProperties::PROPERTY_GC_ENABLED.to_string(),
+                "false".to_string(),
+            ),
         ]);
         let table_properties = TableProperties::try_from(&props).unwrap();
         assert_eq!(table_properties.commit_num_retries, 10);
         assert_eq!(table_properties.commit_max_retry_wait_ms, 20);
         assert_eq!(table_properties.write_format_default, "avro".to_string());
         assert_eq!(table_properties.write_target_file_size_bytes, 512);
+        assert!(!table_properties.gc_enabled);
     }
 
     #[test]
@@ -429,6 +594,17 @@ mod tests {
         assert!(table_properties.to_string().contains(
             "Invalid value for write.target-file-size-bytes: invalid digit found in string"
         ));
+
+        let invalid_gc_enabled = HashMap::from([(
+            TableProperties::PROPERTY_GC_ENABLED.to_string(),
+            "notabool".to_string(),
+        )]);
+        let table_properties = TableProperties::try_from(&invalid_gc_enabled).unwrap_err();
+        assert!(
+            table_properties
+                .to_string()
+                .contains("Invalid value for gc.enabled")
+        );
     }
 
     #[test]
@@ -482,7 +658,7 @@ mod tests {
         )]);
         assert_eq!(
             parse_metadata_file_compression(&props).unwrap(),
-            CompressionCodec::Gzip
+            CompressionCodec::gzip_default()
         );
 
         // Test case insensitivity - "NONE"
@@ -502,7 +678,7 @@ mod tests {
         )]);
         assert_eq!(
             parse_metadata_file_compression(&props).unwrap(),
-            CompressionCodec::Gzip
+            CompressionCodec::gzip_default()
         );
 
         // Test case insensitivity - "GzIp"
@@ -512,7 +688,7 @@ mod tests {
         )]);
         assert_eq!(
             parse_metadata_file_compression(&props).unwrap(),
-            CompressionCodec::Gzip
+            CompressionCodec::gzip_default()
         );
 
         // Test default when property is missing
@@ -543,5 +719,143 @@ mod tests {
                 "Expected error message to contain supported codecs, got: {err_msg}"
             );
         }
+    }
+
+    #[test]
+    fn test_cdc_disabled_by_default() {
+        let props = HashMap::new();
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(!tp.cdc_enabled);
+    }
+
+    #[test]
+    fn test_cdc_enabled_via_flag() {
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+            "true".to_string(),
+        )]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(tp.cdc_enabled);
+        assert_eq!(tp.cdc_min_chunk_size, 256 * 1024);
+        assert_eq!(tp.cdc_max_chunk_size, 1024 * 1024);
+        assert_eq!(tp.cdc_norm_level, 0);
+    }
+
+    #[test]
+    fn test_cdc_size_props_alone_do_not_enable() {
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE.to_string(),
+            "262144".to_string(),
+        )]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(!tp.cdc_enabled);
+    }
+
+    #[test]
+    fn test_cdc_custom_values() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE.to_string(),
+                "200000".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE.to_string(),
+                "900000".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
+                "1".to_string(),
+            ),
+        ]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(tp.cdc_enabled);
+        assert_eq!(tp.cdc_min_chunk_size, 200000);
+        assert_eq!(tp.cdc_max_chunk_size, 900000);
+        assert_eq!(tp.cdc_norm_level, 1);
+    }
+
+    #[test]
+    fn test_cdc_partial_override() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
+                "2".to_string(),
+            ),
+        ]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(tp.cdc_enabled);
+        assert_eq!(tp.cdc_min_chunk_size, 256 * 1024);
+        assert_eq!(tp.cdc_max_chunk_size, 1024 * 1024);
+        assert_eq!(tp.cdc_norm_level, 2);
+    }
+
+    #[test]
+    fn test_cdc_negative_norm_level() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
+                "-2".to_string(),
+            ),
+        ]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert_eq!(tp.cdc_norm_level, -2);
+    }
+
+    #[test]
+    fn test_cdc_invalid_min_chunk_size() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE.to_string(),
+                "not_a_number".to_string(),
+            ),
+        ]);
+        let err = TableProperties::try_from(&props).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "Invalid value for write.parquet.content-defined-chunking.min-chunk-size"
+            )
+        );
+    }
+
+    #[test]
+    fn test_cdc_invalid_norm_level() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "true".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
+                "not_a_number".to_string(),
+            ),
+        ]);
+        let err = TableProperties::try_from(&props).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid value for write.parquet.content-defined-chunking.norm-level")
+        );
+    }
+
+    #[test]
+    fn test_cdc_no_properties() {
+        let props = HashMap::from([("some.other.property".to_string(), "value".to_string())]);
+        let tp = TableProperties::try_from(&props).unwrap();
+        assert!(!tp.cdc_enabled);
     }
 }

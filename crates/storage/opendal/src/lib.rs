@@ -39,16 +39,23 @@ use iceberg::io::{
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
-use opendal::layers::RetryLayer;
+use opendal::layers::{RetryLayer, TimeoutLayer};
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
 
 cfg_if! {
     if #[cfg(feature = "opendal-azdls")] {
         mod azdls;
-        use azdls::AzureStorageScheme;
         use azdls::*;
         use opendal::services::AzdlsConfig;
+    }
+}
+
+cfg_if! {
+    if #[cfg(feature = "opendal-hf")] {
+        mod hf;
+        use hf::*;
+        use opendal::services::HfConfig;
     }
 }
 
@@ -108,9 +115,6 @@ pub enum OpenDalStorageFactory {
     /// S3 storage factory.
     #[cfg(feature = "opendal-s3")]
     S3 {
-        /// s3 storage could have `s3://` and `s3a://`.
-        /// Storing the scheme string here to return the correct path.
-        configured_scheme: String,
         /// Custom AWS credential loader.
         #[serde(skip)]
         customized_credential_load: Option<s3::CustomAwsCredentialLoader>,
@@ -123,10 +127,10 @@ pub enum OpenDalStorageFactory {
     Oss,
     /// Azure Data Lake Storage factory.
     #[cfg(feature = "opendal-azdls")]
-    Azdls {
-        /// The configured Azure storage scheme.
-        configured_scheme: AzureStorageScheme,
-    },
+    Azdls,
+    /// HuggingFace Hub storage factory.
+    #[cfg(feature = "opendal-hf")]
+    Hf,
 }
 
 #[typetag::serde(name = "OpenDalStorageFactory")]
@@ -142,10 +146,8 @@ impl StorageFactory for OpenDalStorageFactory {
             OpenDalStorageFactory::Fs => Ok(Arc::new(OpenDalStorage::LocalFs)),
             #[cfg(feature = "opendal-s3")]
             OpenDalStorageFactory::S3 {
-                configured_scheme,
                 customized_credential_load,
             } => Ok(Arc::new(OpenDalStorage::S3 {
-                configured_scheme: configured_scheme.clone(),
                 config: s3_config_parse(config.props().clone())?.into(),
                 customized_credential_load: customized_credential_load.clone(),
             })),
@@ -158,12 +160,13 @@ impl StorageFactory for OpenDalStorageFactory {
                 config: oss_config_parse(config.props().clone())?.into(),
             })),
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorageFactory::Azdls { configured_scheme } => {
-                Ok(Arc::new(OpenDalStorage::Azdls {
-                    configured_scheme: configured_scheme.clone(),
-                    config: azdls_config_parse(config.props().clone())?.into(),
-                }))
-            }
+            OpenDalStorageFactory::Azdls => Ok(Arc::new(OpenDalStorage::Azdls {
+                config: azdls_config_parse(config.props().clone())?.into(),
+            })),
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorageFactory::Hf => Ok(Arc::new(OpenDalStorage::Hf {
+                config: hf_config_parse(config.props().clone())?.into(),
+            })),
             #[cfg(all(
                 not(feature = "opendal-memory"),
                 not(feature = "opendal-fs"),
@@ -171,6 +174,7 @@ impl StorageFactory for OpenDalStorageFactory {
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -196,11 +200,11 @@ pub enum OpenDalStorage {
     #[cfg(feature = "opendal-fs")]
     LocalFs,
     /// S3 storage variant.
+    ///
+    /// Accepts any S3-family URL (`s3://`, `s3a://`, `s3n://`); the scheme is
+    /// derived from the path at call time.
     #[cfg(feature = "opendal-s3")]
     S3 {
-        /// s3 storage could have `s3://` and `s3a://`.
-        /// Storing the scheme string here to return the correct path.
-        configured_scheme: String,
         /// S3 configuration.
         config: Arc<S3Config>,
         /// Custom AWS credential loader.
@@ -220,18 +224,25 @@ pub enum OpenDalStorage {
         config: Arc<OssConfig>,
     },
     /// Azure Data Lake Storage variant.
-    /// Expects paths of the form
+    ///
+    /// Accepts paths of the form
     /// `abfs[s]://<filesystem>@<account>.dfs.<endpoint-suffix>/<path>` or
     /// `wasb[s]://<container>@<account>.blob.<endpoint-suffix>/<path>`.
+    /// The scheme is derived from the path at call time.
     #[cfg(feature = "opendal-azdls")]
-    #[allow(private_interfaces)]
     Azdls {
-        /// The configured Azure storage scheme.
-        /// Because Azdls accepts multiple possible schemes, we store the full
-        /// passed scheme here to later validate schemes passed via paths.
-        configured_scheme: AzureStorageScheme,
         /// Azure DLS configuration.
         config: Arc<AzdlsConfig>,
+    },
+    /// HuggingFace Hub storage variant.
+    ///
+    /// Accepts paths of the form
+    /// `hf://<repo_type>/<owner>/<repo>[@<revision>]/<path_in_repo>`,
+    /// where `<repo_type>` must be one of `models`, `datasets`, `spaces`, or `buckets`.
+    #[cfg(feature = "opendal-hf")]
+    Hf {
+        /// HuggingFace Hub configuration (token + endpoint).
+        config: Arc<HfConfig>,
     },
 }
 
@@ -274,15 +285,21 @@ impl OpenDalStorage {
             }
             #[cfg(feature = "opendal-s3")]
             OpenDalStorage::S3 {
-                configured_scheme,
                 config,
                 customized_credential_load,
             } => {
                 let op = s3_config_build(config, customized_credential_load, path)?;
                 let op_info = op.info();
 
-                // Check prefix of s3 path.
-                let prefix = format!("{}://{}/", configured_scheme, op_info.name());
+                // Use the URL scheme in the path for prefix matching. This enables
+                // use of S3-compatible storage backends using custom schemes (e.g., `minio://`, `r2://`).
+                let url = url::Url::parse(path).map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid s3 url: {path}: {e}"),
+                    )
+                })?;
+                let prefix = format!("{}://{}/", url.scheme(), op_info.name());
                 if path.starts_with(&prefix) {
                     (op, &path[prefix.len()..])
                 } else {
@@ -319,16 +336,16 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls {
-                configured_scheme,
-                config,
-            } => azdls_create_operator(path, config, configured_scheme)?,
+            OpenDalStorage::Azdls { config } => azdls_create_operator(path, config)?,
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { config } => hf_config_build(config, path)?,
             #[cfg(all(
                 not(feature = "opendal-s3"),
                 not(feature = "opendal-fs"),
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
             ))]
             _ => {
                 return Err(Error::new(
@@ -338,10 +355,33 @@ impl OpenDalStorage {
             }
         };
 
-        // Transient errors are common for object stores; however there's no
-        // harm in retrying temporary failures for other storage backends as well.
-        let operator = operator.layer(RetryLayer::new());
+        // Apply observability/resilience layers. TimeoutLayer must be
+        // inside RetryLayer so each retry attempt is independently
+        // bounded — without a per-attempt timeout, a future parked on a
+        // silently dropped TCP connection never produces an `Err` and
+        // RetryLayer cannot retry, leaving the caller hung indefinitely.
+        // See: https://opendal.apache.org/docs/rust/opendal/layers/struct.TimeoutLayer.html
+        //
+        // Transient errors are common for object stores; we retry temporary
+        // failures with exponential backoff. The retry behavior also
+        // benefits non-object-store backends.
+        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
         Ok((operator, relative_path))
+    }
+
+    /// Returns a cache key used by `delete_stream` to group paths by storage operator.
+    ///
+    /// For most backends the URL host (bucket name) is sufficient. For HF the host
+    /// encodes the repo type, not the repo identity, so a more specific key is used.
+    fn batch_key_for_path(&self, path: &str) -> String {
+        match self {
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { .. } => hf_batch_key(path),
+            _ => url::Url::parse(path)
+                .ok()
+                .and_then(|u| u.host_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        }
     }
 
     /// Extracts the relative path from an absolute path without building an operator.
@@ -357,9 +397,7 @@ impl OpenDalStorage {
             #[cfg(feature = "opendal-fs")]
             OpenDalStorage::LocalFs => Ok(path.strip_prefix("file:/").unwrap_or(&path[1..])),
             #[cfg(feature = "opendal-s3")]
-            OpenDalStorage::S3 {
-                configured_scheme, ..
-            } => {
+            OpenDalStorage::S3 { .. } => {
                 let url = url::Url::parse(path)?;
                 let bucket = url.host_str().ok_or_else(|| {
                     Error::new(
@@ -367,7 +405,7 @@ impl OpenDalStorage {
                         format!("Invalid s3 url: {path}, missing bucket"),
                     )
                 })?;
-                let prefix = format!("{}://{}/", configured_scheme, bucket);
+                let prefix = format!("{}://{}/", url.scheme(), bucket);
                 if path.starts_with(&prefix) {
                     Ok(&path[prefix.len()..])
                 } else {
@@ -416,14 +454,18 @@ impl OpenDalStorage {
                 }
             }
             #[cfg(feature = "opendal-azdls")]
-            OpenDalStorage::Azdls {
-                configured_scheme,
-                config,
-            } => {
+            OpenDalStorage::Azdls { config } => {
                 let azure_path = path.parse::<AzureStoragePath>()?;
-                match_path_with_config(&azure_path, config, configured_scheme)?;
+                match_path_with_config(&azure_path, config)?;
                 let relative_path_len = azure_path.path.len();
                 Ok(&path[path.len() - relative_path_len..])
+            }
+            #[cfg(feature = "opendal-hf")]
+            OpenDalStorage::Hf { .. } => {
+                let parsed = hf::HfUri::parse(path).ok_or_else(|| {
+                    Error::new(ErrorKind::DataInvalid, format!("Invalid hf url: {path}"))
+                })?;
+                Ok(&path[path.len() - parsed.path.len()..])
             }
             #[cfg(all(
                 not(feature = "opendal-s3"),
@@ -431,6 +473,7 @@ impl OpenDalStorage {
                 not(feature = "opendal-gcs"),
                 not(feature = "opendal-oss"),
                 not(feature = "opendal-azdls"),
+                not(feature = "opendal-hf"),
             ))]
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -499,17 +542,18 @@ impl Storage for OpenDalStorage {
         } else {
             format!("{relative_path}/")
         };
-        Ok(op.remove_all(&path).await.map_err(from_opendal_error)?)
+        Ok(op
+            .delete_with(&path)
+            .recursive(true)
+            .await
+            .map_err(from_opendal_error)?)
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
         let mut deleters: HashMap<String, opendal::Deleter> = HashMap::new();
 
         while let Some(path) = paths.next().await {
-            let bucket = url::Url::parse(&path)
-                .ok()
-                .and_then(|u| u.host_str().map(|s| s.to_string()))
-                .unwrap_or_default();
+            let bucket = self.batch_key_for_path(&path);
 
             let (relative_path, deleter) = match deleters.entry(bucket) {
                 Entry::Occupied(entry) => {
@@ -631,47 +675,21 @@ mod tests {
     #[test]
     fn test_relativize_path_s3() {
         let storage = OpenDalStorage::S3 {
-            configured_scheme: "s3".to_string(),
             config: Arc::new(S3Config::default()),
             customized_credential_load: None,
         };
 
-        assert_eq!(
-            storage
-                .relativize_path("s3://my-bucket/path/to/file.parquet")
-                .unwrap(),
-            "path/to/file.parquet"
-        );
-
-        // s3a scheme
-        let storage_s3a = OpenDalStorage::S3 {
-            configured_scheme: "s3a".to_string(),
-            config: Arc::new(S3Config::default()),
-            customized_credential_load: None,
-        };
-        assert_eq!(
-            storage_s3a
-                .relativize_path("s3a://my-bucket/path/to/file.parquet")
-                .unwrap(),
-            "path/to/file.parquet"
-        );
-    }
-
-    #[cfg(feature = "opendal-s3")]
-    #[test]
-    fn test_relativize_path_s3_scheme_mismatch() {
-        let storage = OpenDalStorage::S3 {
-            configured_scheme: "s3".to_string(),
-            config: Arc::new(S3Config::default()),
-            customized_credential_load: None,
-        };
-
-        // Scheme mismatch should error
-        assert!(
-            storage
-                .relativize_path("s3a://my-bucket/path/to/file.parquet")
-                .is_err()
-        );
+        // All S3-family schemes are accepted by the same storage instance.
+        // Custom schemes for S3-compatible stores (e.g., `minio://`) are also
+        // accepted because the path's scheme is used as-is for prefix matching.
+        for scheme in ["s3", "s3a", "s3n", "minio"] {
+            assert_eq!(
+                storage
+                    .relativize_path(&format!("{scheme}://my-bucket/path/to/file.parquet"))
+                    .unwrap(),
+                "path/to/file.parquet"
+            );
+        }
     }
 
     #[cfg(feature = "opendal-gcs")]
@@ -736,7 +754,6 @@ mod tests {
     #[test]
     fn test_relativize_path_azdls() {
         let storage = OpenDalStorage::Azdls {
-            configured_scheme: AzureStorageScheme::Abfss,
             config: Arc::new(AzdlsConfig {
                 account_name: Some("myaccount".to_string()),
                 endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
@@ -749,26 +766,6 @@ mod tests {
                 .relativize_path("abfss://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
                 .unwrap(),
             "/path/to/file.parquet"
-        );
-    }
-
-    #[cfg(feature = "opendal-azdls")]
-    #[test]
-    fn test_relativize_path_azdls_scheme_mismatch() {
-        let storage = OpenDalStorage::Azdls {
-            configured_scheme: AzureStorageScheme::Abfss,
-            config: Arc::new(AzdlsConfig {
-                account_name: Some("myaccount".to_string()),
-                endpoint: Some("https://myaccount.dfs.core.windows.net".to_string()),
-                ..Default::default()
-            }),
-        };
-
-        // wasbs scheme doesn't match configured abfss
-        assert!(
-            storage
-                .relativize_path("wasbs://myfs@myaccount.dfs.core.windows.net/path/to/file.parquet")
-                .is_err()
         );
     }
 }

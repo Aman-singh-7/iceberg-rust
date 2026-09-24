@@ -23,6 +23,8 @@ concurrency:
 
 on:
   push:
+    branches:
+      - main
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
@@ -37,18 +39,23 @@ on:
     - cron: '0 0 * * *'
 
 permissions:
+  # All other permissions are set to none
   contents: read
+  checks: write
+  issues: write
 
 jobs:
   security_audit:
     runs-on: ubuntu-latest
     if: github.repository == 'apache/iceberg-rust'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
           rust-version: stable
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

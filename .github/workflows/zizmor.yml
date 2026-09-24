@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,38 +15,30 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
+name: GitHub Actions Security Analysis with zizmor 🌈
 
-import subprocess
-import sys
-import os
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["**"]
 
-BASE_DIR = os.getcwd()
+permissions: {}
 
+jobs:
+  zizmor:
+    name: Run zizmor 🌈
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
-def check_rust():
-    try:
-        subprocess.run(["cargo", "--version"], check=True)
-        return True
-    except FileNotFoundError:
-        return False
-    except Exception as e:
-        raise Exception("Check rust met unexpected error", e)
-
-def build_core():
-    print("Start building iceberg rust")
-
-    subprocess.run(["cargo", "build", "--release"], check=True)
-
-def main():
-    if not check_rust():
-        print(
-            "Cargo is not found, please check if rust development has been setup correctly"
-        )
-        print("Visit https://www.rust-lang.org/tools/install for more information")
-        sys.exit(1)
-
-    build_core()
-
-if __name__ == "__main__":
-    main()
+      - name: Run zizmor 🌈
+        uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+        with:
+          advanced-security: false

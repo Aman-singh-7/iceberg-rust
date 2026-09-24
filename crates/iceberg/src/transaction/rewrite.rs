@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{Error, ErrorKind};
 use crate::error::Result;
 use crate::spec::{
     DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile,
@@ -33,6 +32,7 @@ use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::{Error, ErrorKind};
 
 /// Action to rewrite data files by replacing a set of existing files with new ones.
 ///
@@ -42,7 +42,6 @@ use crate::transaction::{ActionCommit, TransactionAction};
 pub struct RewriteAction {
     check_duplicate: bool,
     commit_uuid: Option<Uuid>,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
     deleted_data_files: Vec<DataFile>,
@@ -53,7 +52,6 @@ impl RewriteAction {
         Self {
             check_duplicate: true,
             commit_uuid: None,
-            key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
             deleted_data_files: vec![],
@@ -84,12 +82,6 @@ impl RewriteAction {
         self
     }
 
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
-        self
-    }
-
     /// Set snapshot summary properties.
     pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
@@ -105,7 +97,6 @@ impl TransactionAction for RewriteAction {
         let snapshot_producer = SnapshotProducer::new(
             table,
             commit_uuid,
-            self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             self.deleted_data_files.clone(),
@@ -175,11 +166,10 @@ impl SnapshotProduceOperation for RewriteOperation {
             return Ok(vec![]);
         };
 
-        let manifest_list = snapshot
-            .load_manifest_list(
-                snapshot_produce.table.file_io(),
-                &snapshot_produce.table.metadata_ref(),
-            )
+        let manifest_list = snapshot_produce
+            .table
+            .manifest_list_reader(snapshot)
+            .load()
             .await?;
 
         if self.deleted_file_paths.is_empty() {
@@ -205,9 +195,7 @@ impl SnapshotProduceOperation for RewriteOperation {
 
             let mut has_deletes = false;
             for entry in manifest.entries() {
-                if entry.is_alive()
-                    && self.deleted_file_paths.contains(entry.file_path())
-                {
+                if entry.is_alive() && self.deleted_file_paths.contains(entry.file_path()) {
                     found_deleted_paths.insert(entry.file_path().to_string());
                     has_deletes = true;
                 }
@@ -281,7 +269,6 @@ impl RewriteOperation {
         let builder = ManifestWriterBuilder::new(
             output_file,
             Some(self.snapshot_id),
-            manifest_file.key_metadata.clone(),
             table.metadata().current_schema().clone(),
             partition_spec.as_ref().clone(),
         );
@@ -313,7 +300,7 @@ impl RewriteOperation {
                 writer.add_delete_file(
                     deleted.data_file.clone(),
                     sequence_number,
-                    deleted.file_sequence_number
+                    deleted.file_sequence_number,
                 )?;
             } else if entry.is_alive() {
                 // Alive entry not in the delete set → carry forward as Existing
@@ -458,8 +445,9 @@ mod tests {
         };
         assert_eq!(new_snapshot.summary().operation, Operation::Replace);
 
-        let manifest_list = new_snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let manifest_list = table
+            .manifest_list_reader(&Arc::new(new_snapshot.clone()))
+            .load()
             .await
             .unwrap();
         assert_eq!(1, manifest_list.entries().len());
@@ -499,10 +487,7 @@ mod tests {
         let table = tx.commit(&catalog).await.unwrap();
 
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         assert_eq!(1, manifest_list.entries().len());
 
         let replacement_file = file("test/replacement.parquet", spec_id);
@@ -517,10 +502,7 @@ mod tests {
         let snapshot = table.metadata().current_snapshot().unwrap();
         assert_eq!(snapshot.summary().operation, Operation::Replace);
 
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         assert_eq!(2, manifest_list.entries().len());
 
@@ -541,11 +523,10 @@ mod tests {
         );
 
         // Step 3: Fast append after rewrite.
-        // The rewritten manifest containing only [original:Deleted] has
-        // added_files_count=0 and existing_files_count=0, so the fast_append's
-        // existing_manifest filter correctly drops it (only manifests with alive
-        // entries are carried forward). The delete was recorded in the rewrite
-        // snapshot and doesn't need to persist in subsequent snapshots.
+        // The rewritten manifest containing only [original:Deleted] is a
+        // delete-only manifest. FastAppend carries delete-only manifests forward
+        // (see apache/iceberg-rust#2148) until `expire_snapshots` cleans them up,
+        // so the Deleted entry persists alongside the two live files.
         let appended_file = file("test/appended.parquet", spec_id);
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![appended_file.clone()]);
@@ -553,14 +534,25 @@ mod tests {
         let table = tx.commit(&catalog).await.unwrap();
 
         let entries = collect_entries(&table).await;
-        assert_eq!(2, entries.len());
+        assert_eq!(3, entries.len());
 
         assert!(
-            entries.iter().any(|(p, _, _, _)| p == "test/replacement.parquet"),
+            entries
+                .iter()
+                .any(|(p, s, _, _)| p == "test/original.parquet" && *s == ManifestStatus::Deleted),
+            "Original file should remain Deleted after fast_append, entries: {entries:?}",
+        );
+
+        assert!(
+            entries
+                .iter()
+                .any(|(p, _, _, _)| p == "test/replacement.parquet"),
             "Replacement should be present after fast_append, entries: {entries:?}",
         );
         assert!(
-            entries.iter().any(|(p, _, _, _)| p == "test/appended.parquet"),
+            entries
+                .iter()
+                .any(|(p, _, _, _)| p == "test/appended.parquet"),
             "Appended file should be present, entries: {entries:?}",
         );
     }
@@ -775,9 +767,9 @@ mod tests {
         let file_b = file("test/b.parquet", spec_id);
         let file_c = file("test/c.parquet", spec_id);
         let tx = Transaction::new(&table);
-        let action = tx
-            .fast_append()
-            .add_data_files(vec![file_a.clone(), file_b.clone(), file_c.clone()]);
+        let action =
+            tx.fast_append()
+                .add_data_files(vec![file_a.clone(), file_b.clone(), file_c.clone()]);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -882,7 +874,11 @@ mod tests {
             .iter()
             .filter(|(p, _, _, _)| p == "test/a2.parquet" || p == "test/b2.parquet")
             .collect();
-        assert_eq!(alive.len(), 2, "Both a2 and b2 should be present, entries: {entries:?}");
+        assert_eq!(
+            alive.len(),
+            2,
+            "Both a2 and b2 should be present, entries: {entries:?}"
+        );
     }
 
     /// Manifests without any deleted entries should be preserved unchanged (not rewritten).
@@ -907,10 +903,7 @@ mod tests {
 
         // Get manifest paths before rewrite
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list_before = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list_before = table.manifest_list_reader(snapshot).load().await.unwrap();
         let paths_before: Vec<String> = manifest_list_before
             .entries()
             .iter()
@@ -929,10 +922,7 @@ mod tests {
 
         // Get manifest paths after rewrite
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list_after = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list_after = table.manifest_list_reader(snapshot).load().await.unwrap();
         let paths_after: Vec<String> = manifest_list_after
             .entries()
             .iter()
@@ -943,7 +933,11 @@ mod tests {
         let mut b_manifest_path = None;
         for mf in manifest_list_before.entries() {
             let manifest = mf.load_manifest(table.file_io()).await.unwrap();
-            if manifest.entries().iter().any(|e| e.file_path() == "test/b.parquet") {
+            if manifest
+                .entries()
+                .iter()
+                .any(|e| e.file_path() == "test/b.parquet")
+            {
                 b_manifest_path = Some(mf.manifest_path.clone());
                 break;
             }
@@ -1069,11 +1063,15 @@ mod tests {
 
         let entries = collect_entries(&table).await;
         assert!(
-            entries.iter().any(|(p, s, _, _)| p == "test/original.parquet" && *s == ManifestStatus::Deleted),
+            entries
+                .iter()
+                .any(|(p, s, _, _)| p == "test/original.parquet" && *s == ManifestStatus::Deleted),
             "Original should be Deleted, entries: {entries:?}"
         );
         assert!(
-            entries.iter().any(|(p, s, _, _)| p == "test/replacement.parquet" && *s == ManifestStatus::Added),
+            entries
+                .iter()
+                .any(|(p, s, _, _)| p == "test/replacement.parquet" && *s == ManifestStatus::Added),
             "Replacement should be Added, entries: {entries:?}"
         );
         let snapshot = table.metadata().current_snapshot().unwrap();
@@ -1106,7 +1104,10 @@ mod tests {
     async fn test_rewrite_v2_basic_add_and_delete() {
         let catalog = new_memory_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
-        assert_eq!(table.metadata().format_version(), crate::spec::FormatVersion::V2);
+        assert_eq!(
+            table.metadata().format_version(),
+            crate::spec::FormatVersion::V2
+        );
         assert_basic_add_and_delete(&catalog, table).await;
     }
 
@@ -1142,10 +1143,7 @@ mod tests {
 
         // Load the rewritten manifest and verify the deleted entry has a sequence number
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         let mut found_deleted = false;
         for mf in manifest_list.entries() {
@@ -1196,10 +1194,16 @@ mod tests {
 
         let entries = collect_entries(&table).await;
 
-        let deleted_count = entries.iter().filter(|(_, s, _, _)| *s == ManifestStatus::Deleted).count();
+        let deleted_count = entries
+            .iter()
+            .filter(|(_, s, _, _)| *s == ManifestStatus::Deleted)
+            .count();
         assert_eq!(deleted_count, 2, "V2: Both files should be Deleted");
 
-        let added_count = entries.iter().filter(|(_, s, _, _)| *s == ManifestStatus::Added).count();
+        let added_count = entries
+            .iter()
+            .filter(|(_, s, _, _)| *s == ManifestStatus::Added)
+            .count();
         assert_eq!(added_count, 1, "V2: One merged file should be Added");
     }
 
@@ -1216,7 +1220,10 @@ mod tests {
     async fn test_rewrite_v1_basic_add_and_delete() {
         let catalog = new_memory_catalog().await;
         let table = make_v1_minimal_table_in_catalog(&catalog).await;
-        assert_eq!(table.metadata().format_version(), crate::spec::FormatVersion::V1);
+        assert_eq!(
+            table.metadata().format_version(),
+            crate::spec::FormatVersion::V1
+        );
         assert_basic_add_and_delete(&catalog, table).await;
     }
 
@@ -1252,10 +1259,7 @@ mod tests {
 
         // All entries in V1 should have sequence_number = 0
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         for mf in manifest_list.entries() {
             let manifest = mf.load_manifest(table.file_io()).await.unwrap();
@@ -1289,9 +1293,9 @@ mod tests {
         let file_b = file("test/b.parquet", spec_id);
         let file_c = file("test/c.parquet", spec_id);
         let tx = Transaction::new(&table);
-        let action = tx
-            .fast_append()
-            .add_data_files(vec![file_a.clone(), file_b.clone(), file_c.clone()]);
+        let action =
+            tx.fast_append()
+                .add_data_files(vec![file_a.clone(), file_b.clone(), file_c.clone()]);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1308,15 +1312,21 @@ mod tests {
         let entries = collect_entries(&table).await;
 
         assert!(
-            entries.iter().any(|(p, s, _, _)| p == "test/b.parquet" && *s == ManifestStatus::Deleted),
+            entries
+                .iter()
+                .any(|(p, s, _, _)| p == "test/b.parquet" && *s == ManifestStatus::Deleted),
             "V1: file_b should be Deleted"
         );
         assert!(
-            entries.iter().any(|(p, s, _, _)| p == "test/a.parquet" && *s == ManifestStatus::Existing),
+            entries
+                .iter()
+                .any(|(p, s, _, _)| p == "test/a.parquet" && *s == ManifestStatus::Existing),
             "V1: file_a should be Existing"
         );
         assert!(
-            entries.iter().any(|(p, s, _, _)| p == "test/c.parquet" && *s == ManifestStatus::Existing),
+            entries
+                .iter()
+                .any(|(p, s, _, _)| p == "test/c.parquet" && *s == ManifestStatus::Existing),
             "V1: file_c should be Existing"
         );
     }

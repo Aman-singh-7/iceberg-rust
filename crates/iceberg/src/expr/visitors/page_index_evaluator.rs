@@ -736,28 +736,22 @@ impl BoundPredicateVisitor for PageIndexEvaluator<'_> {
                 }
 
                 match (min, max) {
-                    (Some(min), Some(max)) => {
+                    (Some(min), Some(max))
                         if literals
                             .iter()
-                            .all(|datum| datum.lt(&min) || datum.gt(&max))
-                        {
-                            // if all values are outside the bounds, rows cannot match.
-                            return Ok(false);
-                        }
+                            .all(|datum| datum.lt(&min) || datum.gt(&max)) =>
+                    {
+                        // if all values are outside the bounds, no rows can match
+                        return Ok(false);
                     }
-                    (Some(min), _) => {
-                        if !literals.iter().any(|datum| datum.ge(&min)) {
-                            // if none of the values are greater than the min bound, rows cant match
-                            return Ok(false);
-                        }
+                    (Some(min), _) if !literals.iter().any(|datum| datum.ge(&min)) => {
+                        // if no values are within the min bound, no rows can match
+                        return Ok(false);
                     }
-                    (_, Some(max)) => {
-                        if !literals.iter().any(|datum| datum.le(&max)) {
-                            // if all values are greater than upper bound, rows cannot match.
-                            return Ok(false);
-                        }
+                    (_, Some(max)) if !literals.iter().any(|datum| datum.le(&max)) => {
+                        // if no values are within the max bound, no rows can match
+                        return Ok(false);
                     }
-
                     _ => {}
                 }
 
@@ -791,9 +785,9 @@ mod tests {
     use parquet::arrow::arrow_reader::{
         ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelector,
     };
-    use parquet::file::metadata::ParquetMetaData;
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
     use parquet::file::properties::WriterProperties;
-    use rand::{Rng, thread_rng};
+    use rand::Rng;
     use tempfile::NamedTempFile;
 
     use super::PageIndexEvaluator;
@@ -895,7 +889,7 @@ mod tests {
         writer.close().unwrap();
 
         let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
         let metadata = reader.metadata().clone();
 
@@ -936,7 +930,7 @@ mod tests {
         writer.close().unwrap();
 
         let file = temp_file.reopen().unwrap();
-        let options = ArrowReaderOptions::new().with_page_index(true);
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
         let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options).unwrap();
         let metadata = reader.metadata();
 
@@ -1284,13 +1278,13 @@ mod tests {
 
     #[test]
     fn eval_in_length_of_set_above_limit_all_rows() -> Result<()> {
-        let mut rng = thread_rng();
+        let mut rng = rand::rng();
         let (metadata, _temp_file) = create_test_parquet_file()?;
         let (column_index, offset_index, row_group_metadata) = get_test_metadata(&metadata);
         let (iceberg_schema_ref, field_id_map) = build_iceberg_schema_and_field_map()?;
 
         let filter = Reference::new("col_float")
-            .is_in(std::iter::repeat_with(|| Datum::float(rng.gen_range(0.0..10.0))).take(1000))
+            .is_in(std::iter::repeat_with(|| Datum::float(rng.random_range(0.0..10.0))).take(1000))
             .bind(iceberg_schema_ref.clone(), false)?;
 
         let result = PageIndexEvaluator::eval(

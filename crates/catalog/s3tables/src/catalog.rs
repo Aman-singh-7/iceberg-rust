@@ -23,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aws_sdk_s3tables::operation::create_table::CreateTableOutput;
 use aws_sdk_s3tables::operation::get_namespace::GetNamespaceOutput;
-use aws_sdk_s3tables::operation::get_table::GetTableOutput;
+use aws_sdk_s3tables::operation::get_table::{GetTableError, GetTableOutput};
 use aws_sdk_s3tables::operation::list_tables::ListTablesOutput;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
 use aws_sdk_s3tables::types::OpenTableFormat;
@@ -32,7 +32,7 @@ use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
-    TableCommit, TableCreation, TableIdent,
+    Runtime, TableCommit, TableCreation, TableIdent,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
@@ -71,6 +71,7 @@ struct S3TablesCatalogConfig {
 pub struct S3TablesCatalogBuilder {
     config: S3TablesCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
+    runtime: Option<Runtime>,
 }
 
 /// Default builder for [`S3TablesCatalog`].
@@ -85,6 +86,7 @@ impl Default for S3TablesCatalogBuilder {
                 props: HashMap::new(),
             },
             storage_factory: None,
+            runtime: None,
         }
     }
 }
@@ -132,6 +134,11 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
         self
     }
 
+    fn with_runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
     fn load(
         mut self,
         name: impl Into<String>,
@@ -172,7 +179,11 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
                     "Table bucket ARN is required",
                 ))
             } else {
-                S3TablesCatalog::new(self.config, self.storage_factory).await
+                let runtime = match self.runtime {
+                    Some(rt) => rt,
+                    None => Runtime::try_current()?,
+                };
+                S3TablesCatalog::new(self.config, self.storage_factory, runtime).await
             }
         }
     }
@@ -184,6 +195,7 @@ pub struct S3TablesCatalog {
     config: S3TablesCatalogConfig,
     s3tables_client: aws_sdk_s3tables::Client,
     file_io: FileIO,
+    runtime: Runtime,
 }
 
 impl S3TablesCatalog {
@@ -191,6 +203,7 @@ impl S3TablesCatalog {
     async fn new(
         config: S3TablesCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
+        runtime: Runtime,
     ) -> Result<Self> {
         let s3tables_client = if let Some(client) = config.client.clone() {
             client
@@ -202,7 +215,6 @@ impl S3TablesCatalog {
         // Use provided factory or default to OpenDalStorageFactory::S3
         let factory = storage_factory.unwrap_or_else(|| {
             Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: "s3a".to_string(),
                 customized_credential_load: None,
             })
         });
@@ -214,6 +226,7 @@ impl S3TablesCatalog {
             config,
             s3tables_client,
             file_io,
+            runtime,
         })
     }
 
@@ -227,7 +240,23 @@ impl S3TablesCatalog {
             .table_bucket_arn(self.config.table_bucket_arn.clone())
             .namespace(table_ident.namespace().to_url_string())
             .name(table_ident.name());
-        let resp: GetTableOutput = req.send().await.map_err(from_aws_sdk_error)?;
+
+        let resp = req.send().await.map_err(|err| {
+            if err
+                .as_service_error()
+                .is_some_and(GetTableError::is_not_found_exception)
+            {
+                // S3 Tables GetTable API only reports that the resource was not found, and does not distinguish between namespaces and tables.
+                // https://docs.aws.amazon.com/AmazonS3/latest/API/API_s3Buckets_GetTable.html#API_s3Buckets_GetTable_Errors
+                Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("Table {table_ident} is not found, either because the namespace or table did not exist"),
+                )
+                .with_source(err)
+            } else {
+                from_aws_sdk_error(err)
+            }
+        })?;
 
         // when a table is created, it's possible that the metadata location is not set.
         let metadata_location = resp.metadata_location().ok_or_else(|| {
@@ -246,6 +275,7 @@ impl S3TablesCatalog {
             .metadata(metadata)
             .metadata_location(metadata_location)
             .file_io(self.file_io.clone())
+            .runtime(self.runtime.clone())
             .build()?;
         Ok((table, resp.version_token))
     }
@@ -544,6 +574,7 @@ impl Catalog for S3TablesCatalog {
             .metadata_location(metadata_location_str)
             .metadata(metadata)
             .file_io(self.file_io.clone())
+            .runtime(self.runtime.clone())
             .build()?;
         Ok(table)
     }
@@ -562,15 +593,18 @@ impl Catalog for S3TablesCatalog {
         Ok(self.load_table_with_version_token(table_ident).await?.0)
     }
 
-    /// Drops an existing table from the s3tables catalog.
+    /// Not supported for S3Tables. Use `purge_table` instead.
     ///
-    /// Validates the table identifier and then deletes the corresponding
-    /// table from the s3tables catalog.
-    ///
-    /// This function can return an error in the following situations:
-    /// - Errors from the underlying database deletion process, converted using
-    /// `from_aws_sdk_error`.
-    async fn drop_table(&self, table: &TableIdent) -> Result<()> {
+    /// S3 Tables doesn't support soft delete, so dropping a table will permanently remove it from the catalog.
+    async fn drop_table(&self, _table: &TableIdent) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "drop_table is not supported for S3Tables; use purge_table instead",
+        ))
+    }
+
+    /// Purge a table from the S3 Tables catalog.
+    async fn purge_table(&self, table: &TableIdent) -> Result<()> {
         let req = self
             .s3tables_client
             .delete_table()
@@ -704,6 +738,7 @@ where T: std::fmt::Debug {
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
@@ -723,7 +758,9 @@ mod tests {
             props: HashMap::new(),
         };
 
-        Ok(Some(S3TablesCatalog::new(config, None).await?))
+        Ok(Some(
+            S3TablesCatalog::new(config, None, Runtime::current()).await?,
+        ))
     }
 
     #[tokio::test]
@@ -761,14 +798,26 @@ mod tests {
             Err(e) => panic!("Error loading catalog: {e}"),
         };
 
-        let table = catalog
+        let _table = catalog
             .load_table(&TableIdent::new(
                 NamespaceIdent::new("aws_s3_metadata".to_string()),
                 "query_storage_metadata".to_string(),
             ))
             .await
-            .unwrap();
-        println!("{table:?}");
+            .expect("table that exists should be loaded");
+
+        let load_table_err = catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("not_a_namespace".to_string()),
+                "not_a_table_name".to_string(),
+            ))
+            .await
+            .expect_err("loading a table that does not exist should fail");
+        assert_eq!(
+            load_table_err.kind(),
+            ErrorKind::TableNotFound,
+            "must return table not found error for non-existent table"
+        );
     }
 
     #[tokio::test]
@@ -1171,5 +1220,109 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog name cannot be empty");
         }
+    }
+
+    /// Verify that an S3 Table catalog can create a table, write data, load the same table, and read from it.
+    #[tokio::test]
+    async fn test_s3tables_create_table_write_load_table_read() {
+        use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+        use iceberg::writer::file_writer::ParquetWriterBuilder;
+        use iceberg::writer::file_writer::location_generator::{
+            DefaultFileNameGenerator, DefaultLocationGenerator,
+        };
+        use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+
+        let catalog = match load_s3tables_catalog_from_env().await {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(e) => panic!("Error loading catalog: {e}"),
+        };
+
+        let ns = NamespaceIdent::new(format!("test_rw_{}", uuid::Uuid::new_v4().simple()));
+        catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+        let table_name = String::from("table");
+
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap();
+        let creation = TableCreation::builder()
+            .name(table_name.clone())
+            .schema(schema)
+            .build();
+
+        let table = catalog.create_table(&ns, creation).await.unwrap();
+
+        // Write one row.
+        let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(
+            table
+                .metadata()
+                .current_schema()
+                .as_ref()
+                .try_into()
+                .unwrap(),
+        );
+        let batch = arrow_array::RecordBatch::try_new(arrow_schema, vec![Arc::new(
+            arrow_array::Int32Array::from(vec![42]),
+        )])
+        .unwrap();
+
+        // Locations will be generated based on the table metadata, which will be using `s3://` for Amazon S3 Tables.
+        let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "test".to_string(),
+            None,
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            parquet::file::properties::WriterProperties::default(),
+            table.metadata().current_schema().clone(),
+        );
+        let rw = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+        let mut writer = DataFileWriterBuilder::new(rw).build(None).await.unwrap();
+        writer.write(batch.clone()).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(data_files)
+            .apply(tx)
+            .unwrap();
+        tx.commit(&catalog).await.unwrap();
+
+        // Reload from catalog and read back.
+        let table_ident = TableIdent::new(ns.clone(), table_name.clone());
+        let reloaded = catalog.load_table(&table_ident).await.unwrap();
+        let batches: Vec<arrow_array::RecordBatch> = reloaded
+            .scan()
+            .select_all()
+            .build()
+            .expect("scan to be valid (snapshot exists, schema is OK)")
+            .to_arrow()
+            .await
+            .expect("scan tasks should be OK")
+            .try_collect()
+            .await
+            .expect("scan should complete successfully");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0], batch,
+            "read records should match records written earlier"
+        );
+
+        // Clean up.
+        catalog.purge_table(&table_ident).await.ok();
+        catalog.drop_namespace(&ns).await.ok();
     }
 }

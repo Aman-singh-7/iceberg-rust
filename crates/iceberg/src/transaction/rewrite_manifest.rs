@@ -26,8 +26,7 @@ use uuid::Uuid;
 use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, Literal, MAIN_BRANCH, ManifestContentType,
     ManifestEntryRef, ManifestFile, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
-    Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary,
-    update_snapshot_summaries,
+    Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::generate_unique_snapshot_id;
@@ -59,7 +58,6 @@ struct ManifestGroupKey {
 /// `target_manifest_size_bytes` each.
 pub struct RewriteManifestsAction {
     commit_uuid: Option<Uuid>,
-    key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     /// Manifests smaller than this are candidates for compaction.
     min_manifest_size_bytes: u64,
@@ -71,7 +69,6 @@ impl RewriteManifestsAction {
     pub(crate) fn new() -> Self {
         Self {
             commit_uuid: None,
-            key_metadata: None,
             snapshot_properties: HashMap::new(),
             min_manifest_size_bytes: DEFAULT_MIN_MANIFEST_SIZE_BYTES,
             target_manifest_size_bytes: DEFAULT_TARGET_MANIFEST_SIZE_BYTES,
@@ -84,17 +81,8 @@ impl RewriteManifestsAction {
         self
     }
 
-    /// Set key metadata for manifest files.
-    pub fn set_key_metadata(mut self, key_metadata: Vec<u8>) -> Self {
-        self.key_metadata = Some(key_metadata);
-        self
-    }
-
     /// Set snapshot summary properties.
-    pub fn set_snapshot_properties(
-        mut self,
-        snapshot_properties: HashMap<String, String>,
-    ) -> Self {
+    pub fn set_snapshot_properties(mut self, snapshot_properties: HashMap<String, String>) -> Self {
         self.snapshot_properties = snapshot_properties;
         self
     }
@@ -133,9 +121,7 @@ impl TransactionAction for RewriteManifestsAction {
         let snapshot_id = generate_unique_snapshot_id(table);
 
         // Load manifest list from current snapshot
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), &table.metadata_ref())
-            .await?;
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
 
         // Partition manifests: large ones are kept as-is, small ones are compacted
         let mut kept_manifests: Vec<ManifestFile> = Vec::new();
@@ -167,7 +153,6 @@ impl TransactionAction for RewriteManifestsAction {
                 snapshot_id,
                 commit_uuid,
                 &mut manifest_counter,
-                self.key_metadata.clone(),
                 self.target_manifest_size_bytes,
             )
             .await?;
@@ -186,20 +171,23 @@ impl TransactionAction for RewriteManifestsAction {
             DataFileFormat::Avro
         );
 
+        let writer = table
+            .file_io()
+            .new_output(manifest_list_path.clone())?
+            .writer()
+            .await?;
         let mut manifest_list_writer = match table.metadata().format_version() {
-            FormatVersion::V1 => ManifestListWriter::v1(
-                table.file_io().new_output(manifest_list_path.clone())?,
-                snapshot_id,
-                table.metadata().current_snapshot_id(),
-            ),
+            FormatVersion::V1 => {
+                ManifestListWriter::v1(writer, snapshot_id, table.metadata().current_snapshot_id())
+            }
             FormatVersion::V2 => ManifestListWriter::v2(
-                table.file_io().new_output(manifest_list_path.clone())?,
+                writer,
                 snapshot_id,
                 table.metadata().current_snapshot_id(),
                 next_seq_num,
             ),
             FormatVersion::V3 => ManifestListWriter::v3(
-                table.file_io().new_output(manifest_list_path.clone())?,
+                writer,
                 snapshot_id,
                 table.metadata().current_snapshot_id(),
                 next_seq_num,
@@ -216,8 +204,8 @@ impl TransactionAction for RewriteManifestsAction {
             additional_properties,
         };
         let previous_summary = snapshot.summary();
-        let summary = update_snapshot_summaries(summary, Some(previous_summary), false)
-            .map_err(|err| {
+        let summary =
+            update_snapshot_summaries(summary, Some(previous_summary), false).map_err(|err| {
                 Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.")
                     .with_source(err)
             })?;
@@ -284,7 +272,6 @@ async fn compact_group(
     snapshot_id: i64,
     commit_uuid: Uuid,
     manifest_counter: &mut RangeFrom<u64>,
-    key_metadata: Option<Vec<u8>>,
     target_manifest_size_bytes: u64,
 ) -> crate::Result<Vec<ManifestFile>> {
     // Load all manifests and collect alive entries
@@ -321,7 +308,6 @@ async fn compact_group(
         snapshot_id,
         commit_uuid,
         manifest_counter,
-        key_metadata,
         target_manifest_size_bytes,
         avg_entry_bytes,
     );
@@ -367,7 +353,6 @@ struct RollingManifestWriter<'a> {
     snapshot_id: i64,
     commit_uuid: Uuid,
     manifest_counter: &'a mut RangeFrom<u64>,
-    key_metadata: Option<Vec<u8>>,
     target_size_bytes: u64,
     avg_entry_bytes: u64,
     current_writer: Option<ManifestWriter>,
@@ -383,7 +368,6 @@ impl<'a> RollingManifestWriter<'a> {
         snapshot_id: i64,
         commit_uuid: Uuid,
         manifest_counter: &'a mut RangeFrom<u64>,
-        key_metadata: Option<Vec<u8>>,
         target_size_bytes: u64,
         avg_entry_bytes: u64,
     ) -> Self {
@@ -393,7 +377,6 @@ impl<'a> RollingManifestWriter<'a> {
             snapshot_id,
             commit_uuid,
             manifest_counter,
-            key_metadata,
             target_size_bytes,
             avg_entry_bytes,
             current_writer: None,
@@ -429,7 +412,6 @@ impl<'a> RollingManifestWriter<'a> {
         let builder = ManifestWriterBuilder::new(
             output_file,
             Some(self.snapshot_id),
-            self.key_metadata.clone(),
             self.table.metadata().current_schema().clone(),
             partition_spec.as_ref().clone(),
         );
@@ -468,10 +450,12 @@ impl<'a> RollingManifestWriter<'a> {
             self.current_entry_count = 0;
         }
 
-        self.current_writer
-            .as_mut()
-            .unwrap()
-            .add_existing_file(data_file, entry_snapshot_id, sequence_number, file_sequence_number)?;
+        self.current_writer.as_mut().unwrap().add_existing_file(
+            data_file,
+            entry_snapshot_id,
+            sequence_number,
+            file_sequence_number,
+        )?;
         self.current_entry_count += 1;
         Ok(())
     }
@@ -579,11 +563,7 @@ mod tests {
         let spec_id = table.metadata().default_partition_spec_id();
         let mut table = table;
         for i in 0..n {
-            let f = file(
-                &format!("test/file_{i}.parquet"),
-                spec_id,
-                (i as i64) * 100,
-            );
+            let f = file(&format!("test/file_{i}.parquet"), spec_id, (i as i64) * 100);
             let tx = Transaction::new(&table);
             let action = tx.fast_append().add_data_files(vec![f]);
             let tx = action.apply(tx).unwrap();
@@ -595,10 +575,7 @@ mod tests {
     /// Helper: count manifests in the current snapshot.
     async fn count_manifests(table: &crate::table::Table) -> usize {
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         manifest_list.entries().len()
     }
 
@@ -631,9 +608,7 @@ mod tests {
 
         // Compact with a large min_size so all manifests are considered "small"
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -664,9 +639,7 @@ mod tests {
 
         // Compact — large min_size forces all manifests into compaction
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -681,14 +654,8 @@ mod tests {
                 .iter()
                 .find(|(p, _, _, _)| p == path)
                 .unwrap_or_else(|| panic!("File {path} missing after compaction"));
-            assert_eq!(
-                snap_before, &after.2,
-                "snapshot_id mismatch for {path}"
-            );
-            assert_eq!(
-                seq_before, &after.3,
-                "sequence_number mismatch for {path}"
-            );
+            assert_eq!(snap_before, &after.2, "snapshot_id mismatch for {path}");
+            assert_eq!(seq_before, &after.3, "sequence_number mismatch for {path}");
         }
     }
 
@@ -704,9 +671,7 @@ mod tests {
 
         // Set min_size=0 so all manifests have length >= 0, hence "large" and skipped
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(0);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(0);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -748,9 +713,7 @@ mod tests {
 
         // Compact — large min_size forces all manifests into compaction
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -828,9 +791,7 @@ mod tests {
 
         // Compact — large min_size forces all manifests into compaction
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -855,18 +816,14 @@ mod tests {
 
         // First compaction — large min_size forces all manifests into compaction
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
         let entries_after_first = collect_entries(&table).await;
 
         // Second compaction
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
         let entries_after_second = collect_entries(&table).await;
@@ -898,9 +855,7 @@ mod tests {
 
         // Compact with large min_size so even the single manifest is "small"
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -923,19 +878,14 @@ mod tests {
         // Step 1: Create a "large" manifest by compacting 3 files into one manifest.
         let table = append_n_files(&catalog, table, 3).await;
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
         assert_eq!(count_manifests(&table).await, 1);
 
         // Record the large manifest's path — it should survive the next compaction.
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let large_manifest_path = manifest_list.entries()[0].manifest_path.clone();
         let large_manifest_size = manifest_list.entries()[0].manifest_length;
 
@@ -970,10 +920,7 @@ mod tests {
 
         // The large manifest should be the same object (unchanged path)
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let manifest_list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         let paths_after: Vec<&str> = manifest_list
             .entries()
             .iter()
@@ -1019,15 +966,12 @@ mod tests {
         assert!(
             entries_before
                 .iter()
-                .any(|(p, s, _, _)| p == "test/original.parquet"
-                    && *s == ManifestStatus::Deleted)
+                .any(|(p, s, _, _)| p == "test/original.parquet" && *s == ManifestStatus::Deleted)
         );
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1035,7 +979,9 @@ mod tests {
 
         // Deleted entry should be gone
         assert!(
-            !entries_after.iter().any(|(p, _, _, _)| p == "test/original.parquet"),
+            !entries_after
+                .iter()
+                .any(|(p, _, _, _)| p == "test/original.parquet"),
             "Dead entry should be removed after compaction"
         );
 
@@ -1066,9 +1012,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1100,9 +1044,7 @@ mod tests {
         let table = append_n_files(&catalog, table, 2).await;
 
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
@@ -1175,9 +1117,7 @@ mod tests {
 
         // Compact everything
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1260,9 +1200,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1290,7 +1228,6 @@ mod tests {
     /// V2: Basic manifest compaction should work with V2 manifest writers.
     #[tokio::test]
     async fn test_rewrite_manifests_v2_basic_compaction() {
-
         let catalog = new_test_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
@@ -1306,9 +1243,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1330,7 +1265,6 @@ mod tests {
     /// V2: Sequence numbers and snapshot IDs should be preserved through compaction.
     #[tokio::test]
     async fn test_rewrite_manifests_v2_preserves_metadata() {
-
         let catalog = new_test_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
@@ -1340,9 +1274,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1354,10 +1286,7 @@ mod tests {
                 .iter()
                 .find(|(p, _, _, _)| p == path)
                 .unwrap_or_else(|| panic!("V2: File {path} missing after compaction"));
-            assert_eq!(
-                snap_before, &after.2,
-                "V2: snapshot_id mismatch for {path}"
-            );
+            assert_eq!(snap_before, &after.2, "V2: snapshot_id mismatch for {path}");
             assert_eq!(
                 seq_before, &after.3,
                 "V2: sequence_number mismatch for {path}"
@@ -1368,7 +1297,6 @@ mod tests {
     /// V2: Rolling writer should split correctly with V2 manifests.
     #[tokio::test]
     async fn test_rewrite_manifests_v2_rolling_writer() {
-
         let catalog = new_test_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
@@ -1392,13 +1320,16 @@ mod tests {
         );
 
         let entries = collect_entries(&table).await;
-        assert_eq!(entries.len(), 5, "V2: All files should survive rolling split");
+        assert_eq!(
+            entries.len(),
+            5,
+            "V2: All files should survive rolling split"
+        );
     }
 
     /// V2: Compacting after a data rewrite should correctly filter dead entries.
     #[tokio::test]
     async fn test_rewrite_manifests_v2_after_data_rewrite() {
-
         let catalog = new_test_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
         let spec_id = table.metadata().default_partition_spec_id();
@@ -1422,9 +1353,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1432,7 +1361,9 @@ mod tests {
 
         // Deleted entry should be gone
         assert!(
-            !entries.iter().any(|(p, _, _, _)| p == "test/original.parquet"),
+            !entries
+                .iter()
+                .any(|(p, _, _, _)| p == "test/original.parquet"),
             "V2: Deleted entry should be removed after compaction"
         );
 
@@ -1445,7 +1376,6 @@ mod tests {
     /// V2: Summary totals should be preserved through compaction.
     #[tokio::test]
     async fn test_rewrite_manifests_v2_summary_preserved() {
-
         let catalog = new_test_catalog().await;
         let table = make_v2_minimal_table_in_catalog(&catalog).await;
 
@@ -1460,9 +1390,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1485,7 +1413,6 @@ mod tests {
     /// V1 uses build_v1(), ManifestListWriter::v1(), and ManifestEntryV1 Avro schema.
     #[tokio::test]
     async fn test_rewrite_manifests_v1_basic_compaction() {
-
         let catalog = new_test_catalog().await;
         let table = make_v1_minimal_table_in_catalog(&catalog).await;
 
@@ -1501,9 +1428,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1524,7 +1449,6 @@ mod tests {
     /// V1: All sequence numbers should be 0 after compaction.
     #[tokio::test]
     async fn test_rewrite_manifests_v1_sequence_numbers_zero() {
-
         let catalog = new_test_catalog().await;
         let table = make_v1_minimal_table_in_catalog(&catalog).await;
 
@@ -1532,26 +1456,19 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
         let entries = collect_entries(&table).await;
         for (path, _, _, seq) in &entries {
-            assert_eq!(
-                *seq,
-                Some(0),
-                "V1: sequence_number should be 0 for {path}"
-            );
+            assert_eq!(*seq, Some(0), "V1: sequence_number should be 0 for {path}");
         }
     }
 
     /// V1: Snapshot IDs should be preserved through compaction.
     #[tokio::test]
     async fn test_rewrite_manifests_v1_preserves_snapshot_ids() {
-
         let catalog = new_test_catalog().await;
         let table = make_v1_minimal_table_in_catalog(&catalog).await;
 
@@ -1561,9 +1478,7 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
@@ -1575,17 +1490,13 @@ mod tests {
                 .iter()
                 .find(|(p, _, _, _)| p == path)
                 .unwrap_or_else(|| panic!("V1: File {path} missing after compaction"));
-            assert_eq!(
-                snap_before, &after.2,
-                "V1: snapshot_id mismatch for {path}"
-            );
+            assert_eq!(snap_before, &after.2, "V1: snapshot_id mismatch for {path}");
         }
     }
 
     /// V1: Compacting after a data rewrite should filter dead entries.
     #[tokio::test]
     async fn test_rewrite_manifests_v1_after_data_rewrite() {
-
         let catalog = new_test_catalog().await;
         let table = make_v1_minimal_table_in_catalog(&catalog).await;
         let spec_id = table.metadata().default_partition_spec_id();
@@ -1609,16 +1520,16 @@ mod tests {
 
         // Compact
         let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_manifests()
-            .set_min_manifest_size_bytes(u64::MAX);
+        let action = tx.rewrite_manifests().set_min_manifest_size_bytes(u64::MAX);
         let tx = action.apply(tx).unwrap();
         let table = tx.commit(&catalog).await.unwrap();
 
         let entries = collect_entries(&table).await;
 
         assert!(
-            !entries.iter().any(|(p, _, _, _)| p == "test/original.parquet"),
+            !entries
+                .iter()
+                .any(|(p, _, _, _)| p == "test/original.parquet"),
             "V1: Deleted entry should be removed after compaction"
         );
         assert_eq!(entries.len(), 1);
@@ -1628,7 +1539,6 @@ mod tests {
     /// V1: Rolling writer should work with V1 manifests.
     #[tokio::test]
     async fn test_rewrite_manifests_v1_rolling_writer() {
-
         let catalog = new_test_catalog().await;
         let table = make_v1_minimal_table_in_catalog(&catalog).await;
 
@@ -1651,7 +1561,11 @@ mod tests {
         );
 
         let entries = collect_entries(&table).await;
-        assert_eq!(entries.len(), 5, "V1: All files should survive rolling split");
+        assert_eq!(
+            entries.len(),
+            5,
+            "V1: All files should survive rolling split"
+        );
     }
 
     // ========================================================================
@@ -1746,10 +1660,16 @@ mod tests {
         let inf = Literal::float(f32::INFINITY);
 
         // NaN should have a deterministic ordering (OrderedFloat puts NaN > all)
-        assert_ne!(super::compare_literal(&nan, &a), Ordering::Equal,
-            "NaN should not compare equal to a normal float");
-        assert_eq!(super::compare_literal(&nan, &nan), Ordering::Equal,
-            "NaN should compare equal to itself (OrderedFloat semantics)");
+        assert_ne!(
+            super::compare_literal(&nan, &a),
+            Ordering::Equal,
+            "NaN should not compare equal to a normal float"
+        );
+        assert_eq!(
+            super::compare_literal(&nan, &nan),
+            Ordering::Equal,
+            "NaN should compare equal to itself (OrderedFloat semantics)"
+        );
 
         // Inf should sort after normal values
         assert_eq!(super::compare_literal(&inf, &a), Ordering::Greater);

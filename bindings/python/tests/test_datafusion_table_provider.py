@@ -27,9 +27,9 @@ from pathlib import Path
 import datafusion
 from packaging.version import Version
 
-if Version(datafusion.__version__) < Version("52.0.0"):
+if Version(datafusion.__version__) < Version("53.0.0"):
     pytest.skip(
-        "Iceberg table provider requires datafusion>=52 for FFI compatibility",
+        "Iceberg table provider requires datafusion>=53 for FFI compatibility",
         allow_module_level=True,
     )
 
@@ -40,7 +40,7 @@ def warehouse(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def catalog(warehouse: Path) -> Catalog:
+def catalog(warehouse: Path):
     catalog = load_catalog(
         "default",
         **{
@@ -48,7 +48,8 @@ def catalog(warehouse: Path) -> Catalog:
             "warehouse": f"file://{warehouse}",
         },
     )
-    return catalog
+    yield catalog
+    catalog.close()
 
 
 @pytest.fixture(scope="session")

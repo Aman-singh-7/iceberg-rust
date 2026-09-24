@@ -915,6 +915,38 @@ mod tests {
     }
 
     #[test]
+    fn test_unbound_partition_spec_serialization_skips_none_fields() {
+        let spec = UnboundPartitionSpec::builder()
+            .add_partition_field(4, "ts_day".to_string(), Transform::Day)
+            .unwrap()
+            .build();
+
+        let value = serde_json::to_value(&spec).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("spec-id"));
+        let field = object["fields"][0].as_object().unwrap();
+        assert!(!field.contains_key("field-id"));
+
+        let value = serde_json::to_value(spec.with_spec_id(1)).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(Some(&serde_json::json!(1)), object.get("spec-id"));
+
+        // Explicit nulls must still deserialize to `None` for backwards
+        // compatibility.
+        let spec: UnboundPartitionSpec = serde_json::from_str(
+            r#"{
+                "spec-id": null,
+                "fields": [
+                    {"source-id": 4, "name": "ts_day", "transform": "day", "field-id": null}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(None, spec.spec_id);
+        assert_eq!(None, spec.fields[0].field_id);
+    }
+
+    #[test]
     fn test_new_unpartition() {
         let schema = Schema::builder()
             .with_fields(vec![
