@@ -3444,6 +3444,7 @@ pub fn iceberg::ViewUpdate::deserialize<__D>(__deserializer: __D) -> core::resul
 pub struct iceberg::Error
 impl iceberg::Error
 pub fn iceberg::Error::backtrace(&self) -> &std::backtrace::Backtrace
+pub fn iceberg::Error::context_value(&self, key: &str) -> core::option::Option<&str>
 pub fn iceberg::Error::kind(&self) -> iceberg::ErrorKind
 pub fn iceberg::Error::message(&self) -> &str
 pub fn iceberg::Error::new(kind: iceberg::ErrorKind, message: impl core::convert::Into<alloc::string::String>) -> Self
