@@ -331,6 +331,15 @@ impl Error {
     pub fn message(&self) -> &str {
         self.message.as_str()
     }
+
+    /// Return the value recorded under `key` by [`Error::with_context`], if any.
+    /// When the key was recorded more than once, the first value is returned.
+    pub fn context_value(&self, key: &str) -> Option<&str> {
+        self.context
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 macro_rules! define_from_err {
@@ -548,5 +557,25 @@ Source: networking error
 Backtrace:
    0:"#;
         assert_eq!(&s[..expected.len()], expected,);
+    }
+
+    #[test]
+    fn test_context_value_returns_recorded_value() {
+        let err = Error::new(ErrorKind::Unexpected, "x").with_context("status", "409 Conflict");
+        assert_eq!(err.context_value("status"), Some("409 Conflict"));
+    }
+
+    #[test]
+    fn test_context_value_missing_key_is_none() {
+        let err = Error::new(ErrorKind::Unexpected, "x").with_context("status", "409 Conflict");
+        assert_eq!(err.context_value("code"), None);
+    }
+
+    #[test]
+    fn test_context_value_duplicate_key_returns_first() {
+        let err = Error::new(ErrorKind::Unexpected, "x")
+            .with_context("code", "409")
+            .with_context("code", "500");
+        assert_eq!(err.context_value("code"), Some("409"));
     }
 }
