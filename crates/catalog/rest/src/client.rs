@@ -25,8 +25,10 @@ use reqwest::header::HeaderMap;
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use crate::RestCatalogConfig;
+use crate::trace::{current_trace_id, traceparent};
 use crate::types::{ErrorResponse, TokenResponse};
 
 /// Refresh the token slightly before its server-side expiry so an in-flight
@@ -184,7 +186,7 @@ impl HttpClient {
             http::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
         let auth_url = auth_req.url().clone();
-        let auth_resp = self.client.execute(auth_req).await?;
+        let auth_resp = send_traced(&self.client, auth_req).await?;
 
         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
             let text = auth_resp
@@ -345,7 +347,7 @@ impl HttpClient {
     /// Executes the given `Request` and returns a `Response`.
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
         request.headers_mut().extend(self.extra_headers.clone());
-        Ok(self.client.execute(request).await?)
+        Ok(send_traced(&self.client, request).await?)
     }
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and
@@ -408,6 +410,56 @@ impl HttpClient {
     pub(crate) fn disable_header_redaction(&self) -> bool {
         self.disable_header_redaction
     }
+}
+
+/// Sends one request inside an `http` span, with a fresh `X-Request-ID` and, inside
+/// `with_trace_id`, a `traceparent`. Field names match iceberg-catalog's own spans.
+/// The span, and `elapsed_ms`, end when the response headers arrive; the body is
+/// read outside it.
+async fn send_traced(client: &Client, mut request: Request) -> reqwest::Result<Response> {
+    let request_id = uuid::Uuid::new_v4();
+    request.headers_mut().insert(
+        "x-request-id",
+        http::HeaderValue::from_str(&request_id.to_string()).expect("a UUID is plain ASCII"),
+    );
+    let trace = current_trace_id().map(|trace_id| (trace_id, uuid::Uuid::new_v4().as_u64_pair().1));
+    if let Some((trace_id, span_id)) = trace {
+        request.headers_mut().insert(
+            "traceparent",
+            http::HeaderValue::from_str(&traceparent(trace_id, span_id))
+                .expect("hex is plain ASCII"),
+        );
+    }
+    let span = tracing::debug_span!(
+        "http",
+        http.request.method = %request.method(),
+        url.path = request.url().path(),
+        server.address = request.url().host_str().unwrap_or_default(),
+        polaris.request_id = %request_id,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+        elapsed_ms = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    if let Some((trace_id, span_id)) = trace {
+        span.record("trace_id", format_args!("{trace_id:032x}"));
+        span.record("span_id", format_args!("{span_id:016x}"));
+    }
+    let started = Instant::now();
+    let result = client.execute(request).instrument(span.clone()).await;
+    match &result {
+        Ok(response) => {
+            span.record("http.response.status_code", response.status().as_u16());
+        }
+        Err(error) => {
+            // As `dyn Error`, so the cause chain (e.g. connection refused) is recorded too.
+            let error: &(dyn std::error::Error + 'static) = error;
+            span.record("error", error);
+        }
+    }
+    span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    result
 }
 
 /// Deserializes a catalog response into the given [`DeserializedOwned`] type.
@@ -500,7 +552,15 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::io;
+    use std::sync::Once;
+
+    use mockito::{Matcher, Mock, Server, ServerGuard};
+    use tracing_subscriber::fmt::format::FmtSpan;
+
     use super::*;
+    use crate::trace::with_trace_id;
 
     #[test]
     fn test_cached_token_static_never_expires() {
@@ -650,5 +710,294 @@ mod tests {
         assert!(result.contains("application/json"));
         // [REDACTED] should NOT be present when redaction is disabled
         assert!(!result.contains("[REDACTED]"));
+    }
+
+    const TRACE_ID: u128 = 0x0af7651916cd43dd8448eb211c80319c;
+    const UUID_V4: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+
+    thread_local! {
+        static LOGS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Writes into the current thread's `LOGS`.
+    struct ThreadLogs;
+
+    impl io::Write for ThreadLogs {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            LOGS.with_borrow_mut(|logs| logs.extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Starts capturing this thread's DEBUG output; read it with `captured_logs`.
+    /// The subscriber is global: with `set_default`, another test thread can be the
+    /// first to hit the `http` callsite and cache `Interest::never` for everyone. The
+    /// writer is per-thread and `#[tokio::test]` is current-thread, so a test sees
+    /// only its own spans.
+    fn capture_logs() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogs)
+                .with_ansi(false)
+                .with_span_events(FmtSpan::CLOSE)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            // A callsite registered while the global default was being set cached `never`.
+            tracing::callsite::rebuild_interest_cache();
+        });
+        LOGS.with_borrow_mut(Vec::clear);
+    }
+
+    fn captured_logs() -> String {
+        LOGS.with_borrow(|logs| String::from_utf8(logs.clone()).unwrap())
+    }
+
+    /// The close line of every `http` span, in the order the spans closed.
+    fn http_spans(logs: &str) -> Vec<&str> {
+        logs.lines()
+            .filter(|line| {
+                line.contains(" http{") && line.contains("iceberg_catalog_rest::client: close")
+            })
+            .collect()
+    }
+
+    /// The value of `name` among a span's fields, as the fmt layer printed it
+    /// (`&str` fields are quoted, `%` fields are not).
+    fn field<'a>(span: &'a str, name: &str) -> Option<&'a str> {
+        let fields = &span[span.find("http{")? + "http{".len()..span.find("}: ")?];
+        fields
+            .split(' ')
+            .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+    }
+
+    fn http_client(uri: String, props: &[(&str, &str)]) -> HttpClient {
+        let props = props
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        HttpClient::new(&RestCatalogConfig::builder().uri(uri).props(props).build()).unwrap()
+    }
+
+    async fn create_token_mock(server: &mut ServerGuard, expect: usize) -> Mock {
+        server
+            .mock("POST", "/v1/oauth/tokens")
+            .with_status(200)
+            .with_body(
+                r#"{"access_token":"ey000000000000","token_type":"Bearer","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","expires_in":86400}"#,
+            )
+            .expect(expect)
+            .create_async()
+            .await
+    }
+
+    /// One `GET /v1/namespaces` under `TRACE_ID`, with a credential. The first try
+    /// gets a 401, so the client refreshes its token and retries once. Returns the
+    /// captured logs: spans for token, 401, token refresh, retry.
+    async fn list_namespaces_with_401_retry() -> String {
+        let mut server = Server::new_async().await;
+        let token_mock = create_token_mock(&mut server, 2).await;
+        let unauthorized = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(401)
+            .expect(1)
+            .create_async()
+            .await;
+        let ok = server
+            .mock("GET", "/v1/namespaces")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = http_client(server.url(), &[("credential", "client1:secret1")]);
+        capture_logs();
+
+        let request = client
+            .request(Method::GET, format!("{}/v1/namespaces", server.url()))
+            .build()
+            .unwrap();
+        let response = with_trace_id(TRACE_ID, client.query_catalog(request))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        token_mock.assert_async().await;
+        unauthorized.assert_async().await;
+        ok.assert_async().await;
+        captured_logs()
+    }
+
+    #[tokio::test]
+    async fn test_request_in_trace_sends_headers_and_records_span() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/config")
+            .match_header("x-request-id", Matcher::Regex(UUID_V4.to_string()))
+            .match_header(
+                "traceparent",
+                Matcher::Regex(format!("^00-{TRACE_ID:032x}-[0-9a-f]{{16}}-01$")),
+            )
+            .with_status(200)
+            // Echo the headers so the test can tie them to the span's fields.
+            .with_body_from_request(|request| {
+                let header = |name: &str| request.header(name)[0].to_str().unwrap().to_owned();
+                format!("{} {}", header("x-request-id"), header("traceparent")).into_bytes()
+            })
+            .create_async()
+            .await;
+        let client = http_client(server.url(), &[]);
+        capture_logs();
+
+        let request = client
+            .request(Method::GET, format!("{}/v1/config", server.url()))
+            .build()
+            .unwrap();
+        let response = with_trace_id(TRACE_ID, client.execute(request))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        mock.assert_async().await;
+        let echoed = response.text().await.unwrap();
+        let (sent_request_id, sent_traceparent) = echoed.split_once(' ').unwrap();
+        let logs = captured_logs();
+        let spans = http_spans(&logs);
+        assert_eq!(spans.len(), 1, "{logs}");
+        let span = spans[0];
+        assert_eq!(field(span, "http.request.method"), Some("GET"));
+        assert_eq!(field(span, "url.path"), Some("\"/v1/config\""));
+        assert_eq!(field(span, "server.address"), Some("\"127.0.0.1\""));
+        assert_eq!(field(span, "http.response.status_code"), Some("200"));
+        assert_eq!(field(span, "polaris.request_id"), Some(sent_request_id));
+        assert_eq!(
+            field(span, "trace_id"),
+            Some(format!("{TRACE_ID:032x}").as_str())
+        );
+        let span_id = field(span, "span_id").unwrap();
+        assert_eq!(sent_traceparent, format!("00-{TRACE_ID:032x}-{span_id}-01"));
+        assert!(field(span, "elapsed_ms").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_request_outside_trace_has_no_traceparent() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/config")
+            .match_header("x-request-id", Matcher::Regex(UUID_V4.to_string()))
+            .match_header("traceparent", Matcher::Missing)
+            .with_status(200)
+            .create_async()
+            .await;
+        let client = http_client(server.url(), &[]);
+        capture_logs();
+
+        let request = client
+            .request(Method::GET, format!("{}/v1/config", server.url()))
+            .build()
+            .unwrap();
+        client.execute(request).await.unwrap();
+
+        mock.assert_async().await;
+        let logs = captured_logs();
+        let spans = http_spans(&logs);
+        assert_eq!(spans.len(), 1, "{logs}");
+        assert_eq!(field(spans[0], "trace_id"), None);
+        assert_eq!(field(spans[0], "span_id"), None);
+    }
+
+    #[tokio::test]
+    async fn test_401_retry_is_its_own_span_in_the_same_trace() {
+        let logs = list_namespaces_with_401_retry().await;
+        let spans = http_spans(&logs);
+        assert_eq!(spans.len(), 4, "{logs}");
+        let attempts: Vec<&str> = spans
+            .iter()
+            .copied()
+            .filter(|span| field(span, "url.path") == Some("\"/v1/namespaces\""))
+            .collect();
+        assert_eq!(attempts.len(), 2, "{logs}");
+        assert_eq!(field(attempts[0], "http.response.status_code"), Some("401"));
+        assert_eq!(field(attempts[1], "http.response.status_code"), Some("200"));
+        assert_ne!(
+            field(attempts[0], "polaris.request_id"),
+            field(attempts[1], "polaris.request_id")
+        );
+        assert_ne!(field(attempts[0], "span_id"), field(attempts[1], "span_id"));
+        let trace_id = format!("{TRACE_ID:032x}");
+        assert!(
+            spans
+                .iter()
+                .all(|span| field(span, "trace_id") == Some(trace_id.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_exchange_is_traced() {
+        let mut server = Server::new_async().await;
+        let token_mock = create_token_mock(&mut server, 1).await;
+        let config_mock = server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .create_async()
+            .await;
+        let client = http_client(server.url(), &[("credential", "client1:secret1")]);
+        capture_logs();
+
+        let request = client
+            .request(Method::GET, format!("{}/v1/config", server.url()))
+            .build()
+            .unwrap();
+        client.query_catalog(request).await.unwrap();
+
+        token_mock.assert_async().await;
+        config_mock.assert_async().await;
+        let logs = captured_logs();
+        let spans = http_spans(&logs);
+        assert_eq!(spans.len(), 2, "{logs}");
+        assert_eq!(field(spans[0], "http.request.method"), Some("POST"));
+        assert_eq!(field(spans[0], "url.path"), Some("\"/v1/oauth/tokens\""));
+        assert_eq!(field(spans[0], "http.response.status_code"), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn test_transport_failure_records_error() {
+        // A server that accepts one connection and closes it without answering. The
+        // port stays bound until then, so no parallel test can take it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || drop(listener.accept()));
+        let client = http_client(uri.clone(), &[]);
+        capture_logs();
+
+        let request = client
+            .request(Method::GET, format!("{uri}/v1/config"))
+            .build()
+            .unwrap();
+        assert!(client.execute(request).await.is_err());
+
+        let logs = captured_logs();
+        let spans = http_spans(&logs);
+        assert_eq!(spans.len(), 1, "{logs}");
+        assert!(field(spans[0], "error").is_some(), "{logs}");
+        assert_eq!(field(spans[0], "http.response.status_code"), None);
+        assert!(field(spans[0], "elapsed_ms").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_no_credentials_in_traces() {
+        let logs = list_namespaces_with_401_retry().await;
+        assert_eq!(http_spans(&logs).len(), 4, "{logs}");
+        for leaked in ["secret1", "client_secret", "ey000000000000", "Bearer"] {
+            assert!(!logs.contains(leaked), "{leaked} leaked: {logs}");
+        }
+        assert!(
+            !logs.to_ascii_lowercase().contains("authorization"),
+            "{logs}"
+        );
     }
 }

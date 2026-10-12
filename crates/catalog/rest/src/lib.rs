@@ -53,7 +53,9 @@
 
 mod catalog;
 mod client;
+mod trace;
 mod types;
 
 pub use catalog::*;
+pub use trace::{current_trace_id, traceparent, with_trace_id};
 pub use types::*;
