@@ -266,3 +266,6 @@ pub fn iceberg_catalog_rest::UpdateNamespacePropertiesResponse::deserialize<__D>
 pub const iceberg_catalog_rest::REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str
 pub const iceberg_catalog_rest::REST_CATALOG_PROP_URI: &str
 pub const iceberg_catalog_rest::REST_CATALOG_PROP_WAREHOUSE: &str
+pub fn iceberg_catalog_rest::current_trace_id() -> core::option::Option<u128>
+pub fn iceberg_catalog_rest::traceparent(trace_id: u128, span_id: u64) -> alloc::string::String
+pub async fn iceberg_catalog_rest::with_trace_id<F: core::future::future::Future>(trace_id: u128, operation: F) -> <F as core::future::future::Future>::Output
