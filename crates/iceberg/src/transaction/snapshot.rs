@@ -115,7 +115,6 @@ pub(crate) struct SnapshotProducer<'a> {
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
-    deleted_data_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
     // Note: This counter is limited to the range of (0..u64::MAX).
@@ -132,7 +131,6 @@ impl<'a> SnapshotProducer<'a> {
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
         added_data_files: Vec<DataFile>,
-        deleted_data_files: Vec<DataFile>,
     ) -> Self {
         Self {
             table,
@@ -140,7 +138,6 @@ impl<'a> SnapshotProducer<'a> {
             commit_uuid,
             snapshot_properties,
             added_data_files,
-            deleted_data_files,
             manifest_counter: (0..),
         }
     }
