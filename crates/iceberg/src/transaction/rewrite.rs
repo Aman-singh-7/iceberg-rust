@@ -99,7 +99,6 @@ impl TransactionAction for RewriteAction {
             commit_uuid,
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
-            self.deleted_data_files.clone(),
         );
 
         snapshot_producer.validate_added_data_files()?;
